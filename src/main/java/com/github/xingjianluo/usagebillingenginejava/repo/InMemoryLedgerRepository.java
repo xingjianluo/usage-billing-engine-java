@@ -28,7 +28,7 @@ public class InMemoryLedgerRepository implements LedgerRepository {
     @Override
     public List<LedgerEntry> findByInvoice(String invoiceId) {
         return entries.stream()
-                .filter(e -> invoiceId.equals(e.invoiceId()))
+                .filter(e -> invoiceId.equals(e.refId()))
                 .toList();
     }
 

@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 
 /**
@@ -49,16 +50,20 @@ public class PaymentService {
     private final LedgerService ledgerService;
     private final RepositoryLocks locks;
     private final Clock clock;
+    /** 惰性解析，避免 PaymentService 与 AdjustmentService 之间的构造期循环依赖。 */
+    private final ObjectProvider<AdjustmentService> adjustmentServiceProvider;
 
     public PaymentService(InvoiceRepository invoiceRepository, LedgerRepository ledgerRepository,
                           PaymentGateway paymentGateway, LedgerService ledgerService,
-                          RepositoryLocks locks, Clock clock) {
+                          RepositoryLocks locks, Clock clock,
+                          ObjectProvider<AdjustmentService> adjustmentServiceProvider) {
         this.invoiceRepository = invoiceRepository;
         this.ledgerRepository = ledgerRepository;
         this.paymentGateway = paymentGateway;
         this.ledgerService = ledgerService;
         this.locks = locks;
         this.clock = clock;
+        this.adjustmentServiceProvider = adjustmentServiceProvider;
     }
 
     public PaymentResult pay(String invoiceId) {
@@ -133,31 +138,46 @@ public class PaymentService {
     /**
      * 退还已支付发票（全额按实收净额退回，本地模拟退款，无外部依赖）。
      * 退款后发票 VOID（终态），账本满足 CHARGE = CREDIT + REFUND。
+     *
+     * 若该账期已有结算后补差单被收款（PAID），随发票作废一并退回，使账期关闭后
+     * CHARGE = CREDIT + REFUND 依然成立，避免补差部分“只收不退”造成错账。
+     * 加锁顺序固定 sub -> inv -> adj，与补差结算/退款一致，杜绝死锁。
      */
     public PaymentResult refund(String invoiceId) {
         Invoice invoice = invoiceRepository.findById(invoiceId)
                 .orElseThrow(() -> new IllegalArgumentException("发票不存在: " + invoiceId));
-        ReentrantLock lock = locks.forKey("inv:" + invoiceId);
-        lock.lock();
+        ReentrantLock subLock = locks.forKey("sub:" + invoice.subscriptionId());
+        subLock.lock();
         try {
-            log.info("退款输入: invoiceId={}, status={}", invoiceId, invoice.status());
-            if (invoice.status() == InvoiceStatus.VOID) {
-                log.info("发票已作废退款，幂等返回: invoiceId={}", invoiceId);
+            ReentrantLock lock = locks.forKey("inv:" + invoiceId);
+            lock.lock();
+            try {
+                log.info("退款输入: invoiceId={}, status={}", invoiceId, invoice.status());
+                if (invoice.status() == InvoiceStatus.VOID) {
+                    log.info("发票已作废退款，幂等返回: invoiceId={}", invoiceId);
+                    return snapshot(invoice, true, PaymentFailureReason.NONE);
+                }
+                if (invoice.status() != InvoiceStatus.PAID) {
+                    throw new IllegalStateException("仅 PAID 发票可退款，当前状态=" + invoice.status());
+                }
+                Money net = invoice.total();
+                String refundRef = "GW-REF-" + invoiceId;
+                ledgerService.post(invoice.subscriptionId(), LedgerEntryType.REFUND, net,
+                        invoiceId, "作废发票 " + invoiceId + " 通道退款 " + refundRef);
+                invoice.transitionTo(InvoiceStatus.VOID, Instant.now(clock));
+
+                // 联动退回该账期已收款的补差单（补差独立单据，原发票金额始终不变）。
+                adjustmentServiceProvider.getObject()
+                        .refundPaidForPeriodHoldingSubLock(invoice.subscriptionId(), invoice.period());
+
+                log.info("退款完成: invoiceId={}, refundAmount={}, ref={}, 状态=VOID, 账本守恒={}",
+                        invoiceId, net, refundRef, ledgerConservedForInvoice(invoiceId));
                 return snapshot(invoice, true, PaymentFailureReason.NONE);
+            } finally {
+                lock.unlock();
             }
-            if (invoice.status() != InvoiceStatus.PAID) {
-                throw new IllegalStateException("仅 PAID 发票可退款，当前状态=" + invoice.status());
-            }
-            Money net = invoice.total();
-            String refundRef = "GW-REF-" + invoiceId;
-            ledgerService.post(invoice.subscriptionId(), LedgerEntryType.REFUND, net,
-                    invoiceId, "作废发票 " + invoiceId + " 通道退款 " + refundRef);
-            invoice.transitionTo(InvoiceStatus.VOID, Instant.now(clock));
-            log.info("退款完成: invoiceId={}, refundAmount={}, ref={}, 状态=VOID, 账本守恒={}",
-                    invoiceId, net, refundRef, ledgerConservedForInvoice(invoiceId));
-            return snapshot(invoice, true, PaymentFailureReason.NONE);
         } finally {
-            lock.unlock();
+            subLock.unlock();
         }
     }
 

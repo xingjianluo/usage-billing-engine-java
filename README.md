@@ -1,13 +1,13 @@
 # 用量订阅计费引擎（本地模拟版）
 
 一套基于用量的订阅计费与计量流程演示实现：本地内存仓储 + 本地模拟支付通道 +
-只追加账本，使**重复上报、周期内变更、支付失败**在任何入口下都得到一致且可解释的结论。
-不依赖任何外部服务或真实凭据。
+只追加账本，使**重复上报、周期内变更、支付失败**，以及**账单出具后账期内用量的迟到补报**，
+在任何入口下都得到一致且可解释的结论。不依赖任何外部服务或真实凭据。
 
 ## 1. 运行与验证
 
 ```bash
-mvn test          # 14 个单测/集成测试，全部本地、确定性
+mvn test          # 26 个单测/集成测试，全部本地、确定性
 mvn spring-boot:run   # 启动 HTTP 服务（默认 8080）
 ```
 
@@ -38,6 +38,17 @@ curl -X POST localhost:8080/api/invoices/{invoiceId}/retry
 curl -X POST localhost:8080/api/invoices/{invoiceId}/refund
 curl localhost:8080/api/invoices/{invoiceId}
 curl localhost:8080/api/subscriptions/s1/ledger
+
+# 6. 出账后迟到补报：用量仍走原入口正常接收（不丢弃、不影响原票），随后单独触发补差
+curl -X POST localhost:8080/api/usage-events -H 'Content-Type: application/json' -d '{
+  "eventId":"e-late","subscriptionId":"s1","meter":"api_calls","quantity":4000,"occurredAt":"2026-09-08T08:00:00Z"}'
+curl -X POST localhost:8080/api/subscriptions/s1/adjustments -H 'Content-Type: application/json' -d '{
+  "period":"2026-09-15","batchId":"batch-001"}'
+# -> 独立补差单（delta=整期重算净增），原发票编号/明细/金额不变；batchId 为重放/并发幂等键
+curl localhost:8080/api/adjustments/{adjustmentId}
+curl -X POST localhost:8080/api/adjustments/{adjustmentId}/pay
+curl -X POST localhost:8080/api/adjustments/{adjustmentId}/retry
+curl -X POST localhost:8080/api/adjustments/{adjustmentId}/refund
 ```
 
 测试 profile（`spring.profiles.active=test`，测试自动启用）额外提供故障注入接口：
@@ -47,6 +58,13 @@ curl -X POST localhost:8080/api/test-support/payment-script -H 'Content-Type: ap
   "accountId":"s1","outcomes":["INSUFFICIENT_FUNDS","CARD_DECLINED"]}'
 # 此后该账户前两次扣款分别返回“余额不足”“卡过期”，第三次起默认成功
 ```
+
+**本地验证结算后补差**：先出账并支付一张 9 月发票，再用上面的第 6 步补报一条 9 月迟到用量、
+带 `batchId` 触发补差；重复触发应得到同一个 `adjustmentId` 且 `created=false`，
+支付补差后查 `/api/subscriptions/s1/ledger` 可见 `charge = 原发票净额 + 补差`，
+作废原发票后补差被联动退回且 `conserved=true`。关键日志包括
+`补差结算输入 / 补差判定依据（原发票净额、历史补差、重算应计、delta）/ 补差单已生成 /
+补差批次已存在 / 补差收款成功|失败 / 补差退款完成`。
 
 ## 2. 领域与计费模型
 
@@ -108,6 +126,58 @@ SUM(CHARGE) = SUM(CREDIT) + SUM(REFUND)
 按实收净额登记一笔 `REFUND`，发票置 `VOID`，等式成立（见
 `GET /api/subscriptions/{id}/ledger` 的 `conserved` 字段）。失败的支付尝试不产生任何分录。
 
+### 2.5 结算后补报与补差（Adjustment）
+
+账单出具之后，仍会陆续收到发生时间落在该账期内的迟到用量。本层在既有能力上
+**叠加**一层补差，而不是重做账单：
+
+- **接收不变**：迟到事件继续走既有 `/api/usage-events`，按 `eventId` 幂等、按 `occurredAt`
+  归属账期，正常接收、不丢弃，也**不会改动已出发票的编号、明细与金额**。
+- **触发条件**：该账期已存在发票（无论 `OPEN / PAYMENT_FAILED / PAID / VOID`）；
+  对尚未出账的账期调用补差返回 409（请先开票），不悄悄开票、不静默丢单。
+- **计算口径**（与正常出账完全相同，复用同一个 `BillingCalculator`）：
+
+  ```
+  recalculatedTotal = 用当前全部用量（含迟到部分）对整期重新算出的应计总额
+  previouslyBilled  = 原发票净额 + 该账期此前所有补差净额
+  delta             = recalculatedTotal − previouslyBilled
+  ```
+
+  迟到量把整期累计推进更高阶梯档时，按**整期累计量**重新分段计价
+  （例：PRO 免费 5000，出账时累计 1000 免费，补报后累计 5500 →
+  补收 `(5500−5000)×0.01 = 5.00`，而不是只对新到的 4500 单独套价得到 0）。
+  多次变更、变更点落在一天中间时，时间片与按天分摊口径与正常出账一致。
+- **补差为零**：重算后应计总额没有变化（无新增量或仍在免费档内），`delta` 明确为 `0`，
+  不生成补差单、不产生任何费用与分录。
+- **结果可解释**：补差单记录 `recalculatedTotal / previouslyBilled / delta /
+  basisEventIds（依据的全部 eventId）/ basisSummary`，可追溯“净增了多少、依据了哪些用量”。
+
+**望远镜守恒**：每来一批新用量产生一份新补差，
+
+```
+原发票净额 + Σ(该账期所有补差 delta) = 用最终全部用量重新计算的应计总额
+```
+
+因此补差金额对输入确定、可复现；同一批输入无论重放、并发还是重试，金额完全一致。
+
+### 2.6 补差的幂等、收款与状态
+
+- 批次幂等键为 `(subscriptionId, period, batchId)`（由上报方提供，可空）：
+  同键重放/并发只产生一份补差单，其余调用 `created=false` 回读同一份，不重复生成、不重复入账；
+  未提供 `batchId` 时由订阅级锁串行化，调用方可用批次键获得严格的请求级幂等。
+- 补差单是**独立单据**，状态机与发票同口径：
+  `OPEN -> PAID / PAYMENT_FAILED ->(retry) ... -> MAX_RETRIES_EXCEEDED`，`PAID -> REFUNDED`。
+  通道幂等键 `ADJPAY:{adjustmentId}:{attemptNo}`，最大尝试 3 次，失败原因可区分。
+- **入账口径与支付/退款一致**：补差单只在收款成功后登一笔 `CHARGE`
+  （`refType=ADJUSTMENT`），失败尝试不入账。因此：
+  - 账期已 `PAID`：补差单独收款，原支付**不会被重复扣款**；
+  - 账期 `PAYMENT_FAILED / MAX_RETRIES_EXCEEDED`：补差独立成单、可继续收款，不漏计、不静默丢单；
+  - 账期已 `VOID`：仍可接收迟到量并生成补差，补差单独收款。
+- **作废联动**：对一张已支付发票退款作废时，系统同时退回该账期所有已收款的补差单
+  （各登一笔 `REFUND` 并置 `REFUNDED`），账期全部关闭后
+  `SUM(CHARGE) = SUM(CREDIT) + SUM(REFUND)` 依然成立。加锁顺序固定
+  `sub -> inv / sub -> adj`，避免交叉死锁。
+
 ## 3. 发票与支付状态流转
 
 ```
@@ -122,7 +192,17 @@ SUM(CHARGE) = SUM(CREDIT) + SUM(REFUND)
                                                  │ 失败且 attemptCount==3
                                                  ▼
                                       MAX_RETRIES_EXCEEDED（终态，保留最后失败原因）
-   PAID ──refund──▶ VOID（终态，登记 REFUND）
+   PAID ──refund──▶ VOID（终态，登记 REFUND；联动退回该账期已收款补差）
+```
+
+补差单（Adjustment）状态机与发票对称：
+
+```
+   (发票已存在 + 迟到用量) ──settle──▶ OPEN ──pay 成功──▶ PAID（终态，登 ADJUSTMENT/CHARGE）
+                                          │ pay/retry 失败
+                                          ▼
+                                   PAYMENT_FAILED ──retry──▶ ... ──3 次失败──▶ MAX_RETRIES_EXCEEDED
+   PAID ──refund（或随原发票作废联动）──▶ REFUNDED（终态，登 ADJUSTMENT/REFUND）
 ```
 
 - 发票唯一约束为 `(subscriptionId, periodStart)`，由仓储原子保证 +
@@ -143,6 +223,8 @@ SUM(CHARGE) = SUM(CREDIT) + SUM(REFUND)
 | 用量上报 | `eventId` 全局唯一 | 首次 ACCEPTED，之后恒 DUPLICATE，仓储仅 1 条 |
 | 周期内变更 | 同套餐变更忽略；版本点不得早于上一版本 | 结论一致，版本链不乱序 |
 | 开票 | `(subscriptionId, period)` 唯一 | 同一张发票、同一金额，`created=false` |
+| 结算后补差 | `(subscriptionId, period, batchId)` 唯一 + 订阅锁 | 同一份补差单、同一 delta，`created=false`；delta=0 不落单 |
+| 补差收款 | `ADJPAY:补差单:尝试序号` + 单据级锁/状态守卫 | 同键同结果同流水号，终态重复调用不产生新交易 |
 | 通道扣款 | `PAY:发票:尝试序号` | 同键同结果同流水号 |
 | 支付/重试/退款 | 发票级锁 + 状态机守卫 | 终态上重复调用不产生新交易 |
 
@@ -150,17 +232,31 @@ SUM(CHARGE) = SUM(CREDIT) + SUM(REFUND)
 
 ```
 domain/   Money、Plan、MeterTier、Subscription(Version)、UsageEvent、
-          Invoice(LineItem)、PaymentAttempt、LedgerEntry 与各状态/原因枚举
+          Invoice(LineItem)、Adjustment（结算后补差单）、PaymentAttempt、LedgerEntry
+          （含 refType：INVOICE/ADJUSTMENT）与各状态/原因枚举
 repo/     仓储接口 + ConcurrentHashMap/CopyOnWriteArrayList 内存实现 + 按键锁
 service/  PeriodService（周期）、PricingService（阶梯计价）、
+          BillingCalculator（整期费用计算，开票与补差共用同一口径）、
           UsageIngestionService（采集）、SubscriptionService（变更）、
-          InvoiceService（分摊开票）、PaymentGateway/SimulatedPaymentGateway、
-          PaymentService（状态机/重试/退款）、LedgerService（守恒）
-web/      REST 控制器、请求/视图 DTO、统一异常处理（400/404/409）
+          InvoiceService（开票，委托 BillingCalculator）、
+          AdjustmentService（结算后补差的触发/幂等/收款/退款）、
+          PaymentGateway/SimulatedPaymentGateway、
+          PaymentService（发票状态机/重试/退款，退款联动退补差）、LedgerService（守恒）
+web/      REST 控制器（含 AdjustmentController）、请求/视图 DTO、统一异常处理（400/404/409）
 config/   Clock Bean（测试可替换为固定时钟）、套餐种子
 tests/    UsageIngestionTest、PlanChangeProrationTest、ConcurrentInvoiceTest、
-          PaymentRetryTest、BillingEndToEndApiTest
+          PaymentRetryTest、BillingEndToEndApiTest、
+          LateUsageAdjustmentTest、AdjustmentEndToEndApiTest
 ```
+
+### 对原有入口的兼容范围
+
+- 用量上报 `/api/usage-events`、开票、支付/重试/退款、查询、账本接口的**路径、请求体与
+  返回结构均未改变**；迟到事件只是“被正常接收并计入对应账期”，不影响这些入口的既有结论。
+- 补差能力是新增的独立入口（`/api/subscriptions/{id}/adjustments`、
+  `/api/adjustments/{id}/*`）与新增的独立单据/存储，不修改原发票数据。
+- 唯一的内部增强：发票退款时若该账期存在已收款补差会联动退回（使账本继续守恒）；
+  无补差时行为与之前完全一致。原 14 个测试全部保持通过。
 
 关键日志覆盖所有入口的**关键输入与判定依据**（ACCEPTED/DUPLICATE/REJECTED 原因、
 聚合总量、发票各行、通道扣款结果、状态推进、入账后守恒校验），可用
@@ -168,7 +264,10 @@ tests/    UsageIngestionTest、PlanChangeProrationTest、ConcurrentInvoiceTest�
 
 ## 6. 已知边界（演示版）
 
-- 全部状态在内存，重启即清空；生产应替换为数据库事务/行锁，
-  幂等键与 `(订阅,周期)` 唯一约束下沉到存储层。
+- 全部状态（含补差单）在内存，重启即清空；生产应替换为数据库事务/行锁，
+  幂等键与 `(订阅,周期)` 唯一约束、补差 `(订阅,周期,批次)` 唯一约束下沉到存储层。
+- 补差只处理**非负补收**（迟到用量只增不减）。若整期重算总额低于此前已计金额
+  （例如账期内回填了一个会降价的套餐变更点），补差显式报错而不记负账，补退请走退款流程。
+- 补差的触发为显式调用（上报后由调用方/批处理触发结算）；本演示未做“上报即自动补差”。
 - 计费周期固定 UTC 自然月、按天分摊；含税、多币种、预付款余额、
   跨月退款冲销等未纳入本演示。

@@ -2,6 +2,7 @@ package com.github.xingjianluo.usagebillingenginejava.service;
 
 import com.github.xingjianluo.usagebillingenginejava.domain.LedgerEntry;
 import com.github.xingjianluo.usagebillingenginejava.domain.LedgerEntryType;
+import com.github.xingjianluo.usagebillingenginejava.domain.LedgerRefType;
 import com.github.xingjianluo.usagebillingenginejava.domain.Money;
 import com.github.xingjianluo.usagebillingenginejava.repo.LedgerRepository;
 import java.time.Clock;
@@ -33,15 +34,21 @@ public class LedgerService {
 
     public void post(String subscriptionId, LedgerEntryType type, Money amount,
                      String invoiceId, String reason) {
+        post(subscriptionId, type, amount, invoiceId, LedgerRefType.INVOICE, reason);
+    }
+
+    /** 带单据类型的入账：补差单用 LedgerRefType.ADJUSTMENT，与发票口径分列但守恒式相同。 */
+    public void post(String subscriptionId, LedgerEntryType type, Money amount,
+                     String refId, LedgerRefType refType, String reason) {
         if (amount == null || amount.isNegative()) {
             throw new IllegalArgumentException("账本金额不能为负: " + amount);
         }
         LedgerEntry entry = new LedgerEntry(UUID.randomUUID().toString(), subscriptionId,
-                type, amount, invoiceId, reason, Instant.now(clock));
+                type, amount, refId, refType, reason, Instant.now(clock));
         ledgerRepository.save(entry);
-        log.info("账本入账: subscriptionId={}, type={}, amount={}, invoiceId={}, reason={}, "
+        log.info("账本入账: subscriptionId={}, type={}, amount={}, refType={}, refId={}, reason={}, "
                         + "入账后守恒={}",
-                subscriptionId, type, amount, invoiceId, reason, isConserved(subscriptionId));
+                subscriptionId, type, amount, refType, refId, reason, isConserved(subscriptionId));
     }
 
     public Money sum(String subscriptionId, LedgerEntryType type) {

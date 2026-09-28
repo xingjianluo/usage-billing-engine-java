@@ -1,5 +1,6 @@
 package com.github.xingjianluo.usagebillingenginejava.tests;
 
+import com.github.xingjianluo.usagebillingenginejava.repo.InMemoryAdjustmentRepository;
 import com.github.xingjianluo.usagebillingenginejava.repo.InMemoryInvoiceRepository;
 import com.github.xingjianluo.usagebillingenginejava.repo.InMemoryLedgerRepository;
 import com.github.xingjianluo.usagebillingenginejava.repo.InMemoryPlanRepository;
@@ -20,6 +21,7 @@ public class TestResetter {
     private static InMemorySubscriptionRepository subscriptionRepository;
     private static InMemoryUsageEventRepository usageEventRepository;
     private static InMemoryInvoiceRepository invoiceRepository;
+    private static InMemoryAdjustmentRepository adjustmentRepository;
     private static InMemoryLedgerRepository ledgerRepository;
     private static SimulatedPaymentGateway gateway;
     private static TestSeeder seeder;
@@ -29,12 +31,14 @@ public class TestResetter {
                         InMemorySubscriptionRepository subscriptionRepository,
                         InMemoryUsageEventRepository usageEventRepository,
                         InMemoryInvoiceRepository invoiceRepository,
+                        InMemoryAdjustmentRepository adjustmentRepository,
                         InMemoryLedgerRepository ledgerRepository,
                         SimulatedPaymentGateway gateway, TestSeeder seeder) {
         TestResetter.planRepository = planRepository;
         TestResetter.subscriptionRepository = subscriptionRepository;
         TestResetter.usageEventRepository = usageEventRepository;
         TestResetter.invoiceRepository = invoiceRepository;
+        TestResetter.adjustmentRepository = adjustmentRepository;
         TestResetter.ledgerRepository = ledgerRepository;
         TestResetter.gateway = gateway;
         TestResetter.seeder = seeder;
@@ -42,6 +46,7 @@ public class TestResetter {
 
     public static void resetAll() {
         invoiceRepository.clearAll();
+        adjustmentRepository.clearAll();
         ledgerRepository.clearAll();
         usageEventRepository.clearAll();
         subscriptionRepository.clearAll();
