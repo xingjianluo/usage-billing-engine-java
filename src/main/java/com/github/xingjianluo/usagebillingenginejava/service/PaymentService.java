@@ -47,16 +47,19 @@ public class PaymentService {
     private final LedgerRepository ledgerRepository;
     private final PaymentGateway paymentGateway;
     private final LedgerService ledgerService;
+    private final PostBillingAdjustmentService adjustmentService;
     private final RepositoryLocks locks;
     private final Clock clock;
 
     public PaymentService(InvoiceRepository invoiceRepository, LedgerRepository ledgerRepository,
                           PaymentGateway paymentGateway, LedgerService ledgerService,
+                          PostBillingAdjustmentService adjustmentService,
                           RepositoryLocks locks, Clock clock) {
         this.invoiceRepository = invoiceRepository;
         this.ledgerRepository = ledgerRepository;
         this.paymentGateway = paymentGateway;
         this.ledgerService = ledgerService;
+        this.adjustmentService = adjustmentService;
         this.locks = locks;
         this.clock = clock;
     }
@@ -114,6 +117,8 @@ public class PaymentService {
             if (response.success()) {
                 invoice.transitionTo(InvoiceStatus.PAID, Instant.now(clock));
                 postInvoiceLedger(invoice);
+                // 账期未支付期间挂账的补差（迟到用量）随原账单一并收款，不重复扣款、不漏计。
+                adjustmentService.collectOpenAdjustmentsForInvoice(invoice);
                 log.info("支付成功: invoiceId={}, attemptNo={}, gatewayRef={}, 状态=PAID",
                         invoiceId, attemptNo, response.reference());
                 return snapshot(invoice, true, PaymentFailureReason.NONE);
@@ -152,9 +157,14 @@ public class PaymentService {
             String refundRef = "GW-REF-" + invoiceId;
             ledgerService.post(invoice.subscriptionId(), LedgerEntryType.REFUND, net,
                     invoiceId, "作废发票 " + invoiceId + " 通道退款 " + refundRef);
+            // 结算后补差若已收款，随原账单一并按实退回现金并置 VOID；
+            // 未收款的挂账补差不退现金（本来就没扣），保证 CHARGE = CREDIT + REFUND。
+            Money adjustmentRefund = adjustmentService.voidPaidAdjustmentsForInvoice(invoice);
             invoice.transitionTo(InvoiceStatus.VOID, Instant.now(clock));
-            log.info("退款完成: invoiceId={}, refundAmount={}, ref={}, 状态=VOID, 账本守恒={}",
-                    invoiceId, net, refundRef, ledgerConservedForInvoice(invoiceId));
+            log.info("退款完成: invoiceId={}, refundAmount={}(含补差退款 {}), ref={}, 状态=VOID, 账本守恒={}",
+                    invoiceId, net.plus(adjustmentRefund), adjustmentRefund, refundRef,
+                    ledgerConservedForInvoice(invoiceId)
+                            && ledgerService.isConserved(invoice.subscriptionId()));
             return snapshot(invoice, true, PaymentFailureReason.NONE);
         } finally {
             lock.unlock();

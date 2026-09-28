@@ -4,11 +4,14 @@ import com.github.xingjianluo.usagebillingenginejava.domain.BillingPeriod;
 import com.github.xingjianluo.usagebillingenginejava.service.InvoiceService;
 import com.github.xingjianluo.usagebillingenginejava.service.PaymentService;
 import com.github.xingjianluo.usagebillingenginejava.service.PeriodService;
+import com.github.xingjianluo.usagebillingenginejava.service.PostBillingAdjustmentService;
 import com.github.xingjianluo.usagebillingenginejava.service.SubscriptionService;
 import com.github.xingjianluo.usagebillingenginejava.service.LedgerService;
 import com.github.xingjianluo.usagebillingenginejava.service.UsageIngestionService;
 import com.github.xingjianluo.usagebillingenginejava.domain.LedgerEntryType;
 import com.github.xingjianluo.usagebillingenginejava.domain.Money;
+import com.github.xingjianluo.usagebillingenginejava.repo.AdjustmentRepository;
+import com.github.xingjianluo.usagebillingenginejava.service.dto.AdjustmentView;
 import com.github.xingjianluo.usagebillingenginejava.web.dto.IssueInvoiceRequest;
 import com.github.xingjianluo.usagebillingenginejava.web.dto.PlanChangeRequest;
 import com.github.xingjianluo.usagebillingenginejava.web.dto.SubscriptionRequest;
@@ -16,6 +19,7 @@ import com.github.xingjianluo.usagebillingenginejava.web.dto.UsageEventRequest;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.List;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -33,6 +37,8 @@ public class BillingController {
     private final SubscriptionService subscriptionService;
     private final InvoiceService invoiceService;
     private final PaymentService paymentService;
+    private final PostBillingAdjustmentService adjustmentService;
+    private final AdjustmentRepository adjustmentRepository;
     private final PeriodService periodService;
     private final LedgerService ledgerService;
     private final Clock clock;
@@ -41,12 +47,16 @@ public class BillingController {
                              SubscriptionService subscriptionService,
                              InvoiceService invoiceService,
                              PaymentService paymentService,
+                             PostBillingAdjustmentService adjustmentService,
+                             AdjustmentRepository adjustmentRepository,
                              PeriodService periodService,
                              LedgerService ledgerService, Clock clock) {
         this.usageIngestionService = usageIngestionService;
         this.subscriptionService = subscriptionService;
         this.invoiceService = invoiceService;
         this.paymentService = paymentService;
+        this.adjustmentService = adjustmentService;
+        this.adjustmentRepository = adjustmentRepository;
         this.periodService = periodService;
         this.ledgerService = ledgerService;
         this.clock = clock;
@@ -110,6 +120,44 @@ public class BillingController {
             getInvoice(@PathVariable String invoiceId) {
         return com.github.xingjianluo.usagebillingenginejava.service.dto.InvoiceView
                 .from(invoiceService.getInvoice(invoiceId));
+    }
+
+    /**
+     * 结算后补差：对已出账账期，用当前全部可见用量（含迟到补报）整期重算并就净增额出补差单。
+     * 请求体与开票相同：{"period":"2026-09-15"}（可空，取当前周期）。
+     * 同内容批次重放/并发只返回同一张补差单（created=false）。
+     */
+    @PostMapping("/subscriptions/{id}/adjustments")
+    public Object settleAdjustment(@PathVariable String id, @RequestBody(required = false)
+                                   IssueInvoiceRequest request) {
+        LocalDate anchor = request == null || request.period() == null
+                ? null : LocalDate.parse(request.period());
+        BillingPeriod period = anchor == null
+                ? periodService.periodContaining(Instant.now(clock))
+                : periodService.periodOf(anchor);
+        return adjustmentService.settleLateUsage(id, period);
+    }
+
+    @GetMapping("/adjustments/{adjustmentId}")
+    public AdjustmentView getAdjustment(@PathVariable String adjustmentId) {
+        return AdjustmentView.from(adjustmentService.getAdjustment(adjustmentId));
+    }
+
+    /** 显式收取/重试一张挂账或收款失败的补差单（幂等：已收款不重复扣款）。 */
+    @PostMapping("/adjustments/{adjustmentId}/collect")
+    public Object collectAdjustment(@PathVariable String adjustmentId) {
+        return adjustmentService.collectAdjustment(adjustmentId);
+    }
+
+    /** 列出某订阅某账期的全部补差单（按序号升序）。 */
+    @GetMapping("/subscriptions/{id}/adjustments")
+    public List<AdjustmentView> listAdjustments(@PathVariable String id,
+                                                @org.springframework.web.bind.annotation.RequestParam
+                                                String period) {
+        BillingPeriod p = periodService.periodOf(LocalDate.parse(period));
+        return adjustmentRepository.findBySubscriptionAndPeriod(id, p).stream()
+                .map(AdjustmentView::from)
+                .toList();
     }
 
     @GetMapping("/subscriptions/{id}/ledger")
