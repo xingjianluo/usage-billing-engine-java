@@ -121,6 +121,48 @@ class AdjustmentEndToEndApiTest {
                 .andExpect(status().isConflict());
     }
 
+    @Test
+    @DisplayName("HTTP：不传 batchId 时同一批输入重放返回同一单号同一金额，重试不藏掉未收款补差")
+    void replayWithoutBatchIdOverHttpIsIdempotent() throws Exception {
+        String sub = "sub-adj-e2e-nobatch";
+        createSub(sub);
+        report("nb-1", sub, 600, "2026-09-05T08:00:00Z");
+        MvcResult issueRes = postJson("/api/subscriptions/" + sub + "/invoices",
+                "{\"period\":\"2026-09-15\"}");
+        JsonNode invoice = JSON.readTree(issueRes.getResponse().getContentAsString());
+        report("nb-late", sub, 900, "2026-09-10T08:00:00Z");
+
+        // 请求体只给 period、不带 batchId（接口允许省略）。
+        MvcResult first = postJson("/api/subscriptions/" + sub + "/adjustments",
+                "{\"period\":\"2026-09-15\"}");
+        JsonNode a1 = JSON.readTree(first.getResponse().getContentAsString());
+        String adjId = a1.get("adjustmentId").asText();
+        org.junit.jupiter.api.Assertions.assertEquals(10.0, a1.get("delta").asDouble(), 0.001);
+        org.junit.jupiter.api.Assertions.assertEquals(true, a1.get("created").asBoolean());
+
+        // 客户端超时重试：第二次拿到同一个 adjustmentId、同样 10.00、created=false。
+        MvcResult second = postJson("/api/subscriptions/" + sub + "/adjustments",
+                "{\"period\":\"2026-09-15\"}");
+        JsonNode a2 = JSON.readTree(second.getResponse().getContentAsString());
+        org.junit.jupiter.api.Assertions.assertEquals(adjId, a2.get("adjustmentId").asText());
+        org.junit.jupiter.api.Assertions.assertEquals(10.0, a2.get("delta").asDouble(), 0.001);
+        org.junit.jupiter.api.Assertions.assertEquals(false, a2.get("created").asBoolean());
+
+        // 原发票编号/金额始终不变。
+        mockMvc.perform(get("/api/invoices/" + invoice.get("invoiceId").asText()))
+                .andExpect(jsonPath("$.total").value(100.0));
+
+        // 补差收款只成功一次：重放不会再产生一笔费用。
+        mockMvc.perform(post("/api/adjustments/" + adjId + "/pay"))
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.status").value("PAID"));
+        MvcResult third = postJson("/api/subscriptions/" + sub + "/adjustments",
+                "{\"period\":\"2026-09-15\"}");
+        JsonNode a3 = JSON.readTree(third.getResponse().getContentAsString());
+        org.junit.jupiter.api.Assertions.assertEquals(adjId, a3.get("adjustmentId").asText());
+        org.junit.jupiter.api.Assertions.assertEquals(10.0, a3.get("delta").asDouble(), 0.001);
+    }
+
     private void createSub(String sub) throws Exception {
         mockMvc.perform(post("/api/subscriptions").contentType(MediaType.APPLICATION_JSON)
                         .content("""

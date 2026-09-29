@@ -28,6 +28,12 @@ public class Adjustment {
     private final String invoiceId;
     private final int sequenceNo;
     private final String batchId;
+    /**
+     * 内容指纹：本次补差所依据的“整期全部用量事件集合”（eventId 排序后）的确定性子指纹。
+     * 无论调用方是否提供 batchId，同一批输入（看到的用量集合相同）指纹必然相同，
+     * 用于在无 batchId 时仍能对重放/并发/重试回读同一笔补差，而不是把它藏成 0。
+     */
+    private final String contentFingerprint;
     private final Money delta;
     private final Money recalculatedTotal;
     private final Money previouslyBilled;
@@ -41,7 +47,8 @@ public class Adjustment {
     private Instant updatedAt;
 
     public Adjustment(String id, String subscriptionId, BillingPeriod period, String invoiceId,
-                      int sequenceNo, String batchId, Money delta, Money recalculatedTotal,
+                      int sequenceNo, String batchId, String contentFingerprint, Money delta,
+                      Money recalculatedTotal,
                       Money previouslyBilled, List<String> basisEventIds, String basisSummary,
                       Instant createdAt) {
         this.id = id;
@@ -50,6 +57,7 @@ public class Adjustment {
         this.invoiceId = invoiceId;
         this.sequenceNo = sequenceNo;
         this.batchId = batchId;
+        this.contentFingerprint = contentFingerprint;
         this.delta = delta;
         this.recalculatedTotal = recalculatedTotal;
         this.previouslyBilled = previouslyBilled;
@@ -83,6 +91,10 @@ public class Adjustment {
 
     public String batchId() {
         return batchId;
+    }
+
+    public String contentFingerprint() {
+        return contentFingerprint;
     }
 
     public Money delta() {

@@ -7,7 +7,7 @@
 ## 1. 运行与验证
 
 ```bash
-mvn test          # 26 个单测/集成测试，全部本地、确定性
+mvn test          # 34 个单测/集成测试，全部本地、确定性
 mvn spring-boot:run   # 启动 HTTP 服务（默认 8080）
 ```
 
@@ -45,6 +45,13 @@ curl -X POST localhost:8080/api/usage-events -H 'Content-Type: application/json'
 curl -X POST localhost:8080/api/subscriptions/s1/adjustments -H 'Content-Type: application/json' -d '{
   "period":"2026-09-15","batchId":"batch-001"}'
 # -> 独立补差单（delta=整期重算净增），原发票编号/明细/金额不变；batchId 为重放/并发幂等键
+
+# batchId 可省略：请求体只给 period。同一批输入重复提交（超时重试/处理两遍）
+# 由“整期依据事件集合”的内容指纹幂等，第二次起回读同一笔，金额/单号与第一次完全一致。
+curl -X POST localhost:8080/api/subscriptions/s1/adjustments -H 'Content-Type: application/json' -d '{
+  "period":"2026-09-15"}'
+curl -X POST localhost:8080/api/subscriptions/s1/adjustments -H 'Content-Type: application/json' -d '{
+  "period":"2026-09-15"}'   # created=false，adjustmentId/delta 与上一次相同
 curl localhost:8080/api/adjustments/{adjustmentId}
 curl -X POST localhost:8080/api/adjustments/{adjustmentId}/pay
 curl -X POST localhost:8080/api/adjustments/{adjustmentId}/retry
@@ -62,9 +69,25 @@ curl -X POST localhost:8080/api/test-support/payment-script -H 'Content-Type: ap
 **本地验证结算后补差**：先出账并支付一张 9 月发票，再用上面的第 6 步补报一条 9 月迟到用量、
 带 `batchId` 触发补差；重复触发应得到同一个 `adjustmentId` 且 `created=false`，
 支付补差后查 `/api/subscriptions/s1/ledger` 可见 `charge = 原发票净额 + 补差`，
-作废原发票后补差被联动退回且 `conserved=true`。关键日志包括
-`补差结算输入 / 补差判定依据（原发票净额、历史补差、重算应计、delta）/ 补差单已生成 /
-补差批次已存在 / 补差收款成功|失败 / 补差退款完成`。
+作废原发票后补差被联动退回且 `conserved=true`。
+
+**复现“不传 batchId 的重放/并发/重试”修复（`NullBatchIdempotencyTest`）**：
+
+```bash
+# 只跑该用例类（7 个场景）
+mvn test -Dtest=NullBatchIdempotencyTest
+```
+
+覆盖：①不带 `batchId` 同批输入重放返回同一单号/同一金额；②16 线程无键并发只落一笔、
+无人拿到 0；③整期确无净增时 `delta=0` 且不落单；④已存在未收款补差时（不带键、或换新
+batchId）相同输入回读同一笔；⑤补差收款失败挂起后重放仍回读该笔并可继续重试；
+⑥混用带键/不带键 12 线程并发只落一笔；⑦多批新用量逐笔累加、交错重放一致且望远镜守恒
+（`原账单净额 + Σ补差 = 最终全量重算应计`，一笔补差只收一次款）。
+HTTP 入口的对应用例见 `AdjustmentEndToEndApiTest#replayWithoutBatchIdOverHttpIsIdempotent`。
+
+关键日志包括 `补差结算输入 / 补差判定依据（原发票净额、历史补差、重算应计、delta、
+内容指纹）/ 补差输入已存在，幂等返回同一份 / 补差单已生成 /
+补差收款成功|失败 / 补差退款完成`。
 
 ## 2. 领域与计费模型
 
@@ -147,8 +170,12 @@ SUM(CHARGE) = SUM(CREDIT) + SUM(REFUND)
   （例：PRO 免费 5000，出账时累计 1000 免费，补报后累计 5500 →
   补收 `(5500−5000)×0.01 = 5.00`，而不是只对新到的 4500 单独套价得到 0）。
   多次变更、变更点落在一天中间时，时间片与按天分摊口径与正常出账一致。
-- **补差为零**：重算后应计总额没有变化（无新增量或仍在免费档内），`delta` 明确为 `0`，
-  不生成补差单、不产生任何费用与分录。
+- **补差为零的唯一判定**：用当前能看到的全部用量把整期重新算一遍，
+  **应计总额与“原发票净额 + 该账期此前所有补差净额”完全相等（一点净增都没有）**，
+  且不存在与本次输入同内容、尚未收款的既有补差单时，`delta` 才明确为 `0`，
+  不生成补差单、不产生任何费用与分录。若此前已经为同一批输入生成过补差（哪怕尚未收款），
+  重放必须回读那一笔（金额、单号一致），**绝不允许把已产生、还没收款的补差藏成 `delta=0`
+  与空单号**。
 - **结果可解释**：补差单记录 `recalculatedTotal / previouslyBilled / delta /
   basisEventIds（依据的全部 eventId）/ basisSummary`，可追溯“净增了多少、依据了哪些用量”。
 
@@ -158,13 +185,33 @@ SUM(CHARGE) = SUM(CREDIT) + SUM(REFUND)
 原发票净额 + Σ(该账期所有补差 delta) = 用最终全部用量重新计算的应计总额
 ```
 
-因此补差金额对输入确定、可复现；同一批输入无论重放、并发还是重试，金额完全一致。
+因此补差金额对输入确定、可复现；同一批输入无论重放、并发还是重试，金额与补差单号完全一致。
+
+#### 2.5.1 不传 batchId 时的返回语义（内容指纹幂等）
+
+调用方**可以省略**可选的 `batchId`。省略后系统不再依赖调用方给键，而是对“本次整期重算所
+依据的全部 `eventId` 集合（排序后）”计算一个确定性**内容指纹（SHA-256）**，用
+`(subscriptionId, period, contentFingerprint)` 兜底幂等：
+
+| 情形 | 返回语义 |
+|---|---|
+| 同一批输入（账期可见用量集合不变）重放/并发/重试，**不带 batchId** | 恒回读**同一笔**补差单：同一 `adjustmentId`、同一 `delta`，仅首次 `created=true`；无论那笔补差当前是 `OPEN / PAYMENT_FAILED / PAID / REFUNDED` 都不藏单 |
+| 同一批输入先带 `batchId=A` 生成、补差**尚未收款**，后用 `batchId=B` 或不带键重提 | 回读**同一笔**未收款补差（金额、单号一致），不生成第二笔、不重复收款 |
+| 同一批输入对应的补差**已经收款（PAID/REFUNDED）**，再用一个**新的 batchId** 提交 | 望远镜口径下新增净增恰为 0：返回 `delta=0`、不落第二笔（同 batchId 重放仍回读原单） |
+| 整期确实没有任何净增（重算应计 == 此前已计，且无同内容补差） | `delta=0`、`adjustmentId=null`、不落单；重放结论不变 |
+| 又到了一批**新**用量（事件集合变大，指纹变化） | 产生新一笔补差；多笔补差逐笔累加满足望远镜守恒 |
+
+> 关键不变量：**只要一笔补差已经产生且还没收款，任何形式的重复提交（重放、并发、超时重试，
+> 带或不带 `batchId`）拿到的都是那笔补差本身，绝不会出现“第二次返回 0、单号为空、钱却挂在
+> 待收款”的对不上账情况。**
 
 ### 2.6 补差的幂等、收款与状态
 
-- 批次幂等键为 `(subscriptionId, period, batchId)`（由上报方提供，可空）：
+- 批次幂等键为 `(subscriptionId, period, batchId)`（由上报方提供，**可空**）：
   同键重放/并发只产生一份补差单，其余调用 `created=false` 回读同一份，不重复生成、不重复入账；
-  未提供 `batchId` 时由订阅级锁串行化，调用方可用批次键获得严格的请求级幂等。
+  **未提供 `batchId` 时由“整期依据事件集合”的内容指纹 `(subscriptionId, period,
+  contentFingerprint)` 兜底**，同样保证同一批输入重放/并发/重试只产生一份补差单、
+  返回同一金额与同一单号。所有判定都在订阅级锁内串行完成，结论确定可复现。
 - 补差单是**独立单据**，状态机与发票同口径：
   `OPEN -> PAID / PAYMENT_FAILED ->(retry) ... -> MAX_RETRIES_EXCEEDED`，`PAID -> REFUNDED`。
   通道幂等键 `ADJPAY:{adjustmentId}:{attemptNo}`，最大尝试 3 次，失败原因可区分。
@@ -223,7 +270,7 @@ SUM(CHARGE) = SUM(CREDIT) + SUM(REFUND)
 | 用量上报 | `eventId` 全局唯一 | 首次 ACCEPTED，之后恒 DUPLICATE，仓储仅 1 条 |
 | 周期内变更 | 同套餐变更忽略；版本点不得早于上一版本 | 结论一致，版本链不乱序 |
 | 开票 | `(subscriptionId, period)` 唯一 | 同一张发票、同一金额，`created=false` |
-| 结算后补差 | `(subscriptionId, period, batchId)` 唯一 + 订阅锁 | 同一份补差单、同一 delta，`created=false`；delta=0 不落单 |
+| 结算后补差 | `(订阅, 周期, batchId)` 唯一；无 batchId 时 `(订阅, 周期, 内容指纹)` 兜底 + 订阅锁 | 同一份补差单、同一 delta 与单号，`created=false`；仅整期确无净增才 delta=0 不落单 |
 | 补差收款 | `ADJPAY:补差单:尝试序号` + 单据级锁/状态守卫 | 同键同结果同流水号，终态重复调用不产生新交易 |
 | 通道扣款 | `PAY:发票:尝试序号` | 同键同结果同流水号 |
 | 支付/重试/退款 | 发票级锁 + 状态机守卫 | 终态上重复调用不产生新交易 |
@@ -246,7 +293,8 @@ web/      REST 控制器（含 AdjustmentController）、请求/视图 DTO、统
 config/   Clock Bean（测试可替换为固定时钟）、套餐种子
 tests/    UsageIngestionTest、PlanChangeProrationTest、ConcurrentInvoiceTest、
           PaymentRetryTest、BillingEndToEndApiTest、
-          LateUsageAdjustmentTest、AdjustmentEndToEndApiTest
+          LateUsageAdjustmentTest、AdjustmentEndToEndApiTest、
+          NullBatchIdempotencyTest（不传 batchId 时的重放/并发/重试/零值/回读/累计守恒）
 ```
 
 ### 对原有入口的兼容范围

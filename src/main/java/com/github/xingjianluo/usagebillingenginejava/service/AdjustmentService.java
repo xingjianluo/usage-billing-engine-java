@@ -42,9 +42,11 @@ import org.springframework.stereotype.Service;
  *
  * 不改写原账单：补差是新单据，原发票编号/明细/金额永不变化。
  *
- * 幂等：批次键 (subscriptionId, period, batchId) 唯一 + 订阅级锁；
- *   - 同一批输入重放/并发：batchId 命中既有补差单，created=false 返回同一份，不重复入账；
- *   - 无新增用量或重算后总额无变化：delta=0，明确不产生补差单、不产生费用。
+ * 幂等：批次键 (subscriptionId, period, batchId) 唯一 + 订阅锁；即使 batchId 为空，
+ * 仍以“整期全部依据事件集合”的内容指纹兜底去重：
+ *   - 同一批输入重放/并发/重试（带或不带 batchId）：命中既有补差单，created=false 返回同一份，
+ *     金额、单号完全一致，绝不把已经产生、尚未收款的补差藏成 delta=0/空单号；
+ *   - 只有整期重算应计总额确实等于此前已计金额（一点净增都没有）时，才返回 delta=0 且不落单。
  *
  * 收款/退款口径与发票一致：补差单只在收款成功后登一笔 CHARGE；失败可区分原因并可重试，
  * 达到上限进入终态不静默丢单；PAID 补差可退款登 REFUND。
@@ -88,7 +90,8 @@ public class AdjustmentService {
 
     /**
      * 对某订阅的账期触发一次结算后补差。
-     * @param batchId 上报方提供的批次幂等键，可空；非空时同键重放/并发只产生一份补差单。
+     * @param batchId 上报方提供的批次幂等键，可空；为空时由整期用量内容指纹保证
+     *                同一批输入重放/并发/重试仍回读同一笔补差。
      */
     public AdjustmentResult settle(String subscriptionId, BillingPeriod period, String batchId) {
         log.info("补差结算输入: subscriptionId={}, period=[{} {}), batchId={}",
@@ -99,14 +102,20 @@ public class AdjustmentService {
         ReentrantLock lock = locks.forKey("sub:" + subscriptionId);
         lock.lock();
         try {
-            // 幂等：同批次键已结算过，直接回读同一份补差单。
+            // 幂等回读（持有订阅锁，串行判定，结论确定）：
+            // 1) 显式批次键命中 -> 同批重放/并发，回读同一笔；
+            // 2) 未带批次键时，按“整期依据事件集合”的内容指纹回读 ->
+            //    同一批输入即便客户端超时重试、重放，也拿到同一笔补差，绝不藏成 0/空单号；
+            // 3) 带了新 batchId 但指纹命中一笔“尚未收款”的补差 -> 同样回读，
+            //    防止把挂在待收款的补差藏成 0、也防止重复落单；
+            //    若那笔已收款，则放行到望远镜口径，重算净增恰为 0 时明确返回 0、不再落单。
+            Adjustment existing = null;
+            String idempotencyReason = null;
             if (batchId != null) {
-                var existing = adjustmentRepository.findByBatch(subscriptionId, period, batchId);
-                if (existing.isPresent()) {
-                    Adjustment a = existing.get();
-                    log.info("补差批次已存在，幂等返回同一份: adjustmentId={}, delta={}, status={}"
-                                    + "（不重复生成/入账）", a.id(), a.delta(), a.status());
-                    return toResult(a, false, "批次键 " + batchId + " 已结算，返回既有补差单");
+                var byBatch = adjustmentRepository.findByBatch(subscriptionId, period, batchId);
+                if (byBatch.isPresent()) {
+                    existing = byBatch.get();
+                    idempotencyReason = "批次键 " + batchId + " 已结算，返回既有补差单";
                 }
             }
 
@@ -117,6 +126,40 @@ public class AdjustmentService {
 
             BillingCalculation calc = billingCalculator.calculate(subscription, period);
             Money recalculatedTotal = calc.netTotal();
+            String fingerprint = contentFingerprint(calc.basisEventIds());
+
+            if (existing == null) {
+                var byFingerprint = adjustmentRepository.findByContentFingerprint(
+                        subscriptionId, period, fingerprint);
+                if (byFingerprint.isPresent()) {
+                    Adjustment byFp = byFingerprint.get();
+                    boolean collected = byFp.status() == AdjustmentStatus.PAID
+                            || byFp.status() == AdjustmentStatus.REFUNDED;
+                    if (batchId == null) {
+                        // 未提供批次键：同一批输入的任何重放/重试，无论那笔补差当前是什么状态，
+                        // 都必须回读同一笔，保证金额与单号可复现、绝不藏单。
+                        existing = byFp;
+                        idempotencyReason = "同一批输入（内容指纹一致）已结算，未提供批次键也回读"
+                                + "既有补差单";
+                    } else if (!collected) {
+                        // 同一批输入换了个 batchId 重提，而既有补差仍挂在未收款状态
+                        // （OPEN/PAYMENT_FAILED/RETRYING/MAX_RETRIES_EXCEEDED）：
+                        // 必须回读那笔，绝不能把它当成“没有净增”而藏成 0/空单号。
+                        existing = byFp;
+                        idempotencyReason = "该批输入（内容指纹一致）此前已用批次键 "
+                                + byFp.batchId() + " 结算且补差尚未收款，返回同一笔补差单，"
+                                + "不重复落单";
+                    }
+                    // batchId 非空且既有补差已收款（PAID/REFUNDED）：不拦截，落入下面的
+                    // 望远镜口径——重算净增恰为 0，明确返回 delta=0、不再落第二笔、不重复收款。
+                }
+            }
+            if (existing != null) {
+                log.info("补差输入已存在，幂等返回同一份: adjustmentId={}, delta={}, status={}, "
+                                + "batchId={}（不重复生成/入账，不把未收款补差藏成 0）",
+                        existing.id(), existing.delta(), existing.status(), existing.batchId());
+                return toResult(existing, false, idempotencyReason);
+            }
 
             Money previouslyBilled = invoice.total();
             List<Adjustment> prior =
@@ -128,9 +171,9 @@ public class AdjustmentService {
             Money delta = recalculatedTotal.minus(previouslyBilled);
             String basisSummary = summarize(calc, invoice, recalculatedTotal, previouslyBilled);
             log.info("补差判定依据: subscriptionId={}, period={}, 原发票净额={}, 历史补差数={}, "
-                            + "重算应计总额={}, 此前已计={}, delta={}",
+                            + "重算应计总额={}, 此前已计={}, delta={}, 内容指纹={}",
                     subscriptionId, period.start(), invoice.total(), prior.size(),
-                    recalculatedTotal, previouslyBilled, delta);
+                    recalculatedTotal, previouslyBilled, delta, fingerprint);
 
             // 用量只增不减，迟到补报不应让整期应计下降；若出现（如套餐版本回填变更），
             // 属于另一类“补退”流程，显式报错而不是静默记错账。
@@ -142,8 +185,10 @@ public class AdjustmentService {
                                 + delta + "；补退请走退款流程");
             }
             if (delta.equals(Money.zero())) {
+                // 零值判定的唯一条件：用当前能看到的全部用量整期重算，应计总额 == 此前已计金额，
+                // 且不存在同一内容指纹的补差单（该情况已在上面回读，绝不会走到这里）。
                 log.info("补差金额为 0，不产生补差单、不入账: subscriptionId={}, period={}, "
-                                + "依据=重算总额 {} 等于此前已计 {}",
+                                + "依据=重算总额 {} 等于此前已计 {}（整期确无净增）",
                         subscriptionId, period.start(), recalculatedTotal, previouslyBilled);
                 return new AdjustmentResult(null, subscriptionId, invoice.id(),
                         period.start().toString(), period.end().toString(), prior.size(), batchId,
@@ -154,8 +199,9 @@ public class AdjustmentService {
 
             int sequenceNo = prior.size() + 1;
             Adjustment adjustment = new Adjustment(UUID.randomUUID().toString(), subscriptionId,
-                    period, invoice.id(), sequenceNo, batchId, delta, recalculatedTotal,
-                    previouslyBilled, calc.basisEventIds(), basisSummary, Instant.now(clock));
+                    period, invoice.id(), sequenceNo, batchId, fingerprint, delta,
+                    recalculatedTotal, previouslyBilled, calc.basisEventIds(), basisSummary,
+                    Instant.now(clock));
 
             Adjustment concurrent =
                     adjustmentRepository.insertIfAbsent(adjustment).orElse(null);
@@ -165,12 +211,35 @@ public class AdjustmentService {
                 return toResult(concurrent, false, "并发批次已被另一请求结算，返回同一份补差单");
             }
             log.info("补差单已生成: adjustmentId={}, invoiceId={}, seq={}, batchId={}, delta={}, "
-                            + "重算总额={}, 依据事件数={}（原发票不改写）",
+                            + "重算总额={}, 依据事件数={}, 内容指纹={}（原发票不改写）",
                     adjustment.id(), invoice.id(), sequenceNo, batchId, delta,
-                    recalculatedTotal, calc.basisEventIds().size());
+                    recalculatedTotal, calc.basisEventIds().size(), fingerprint);
             return toResult(adjustment, true, "检测到迟到用量，已按整期重算生成补差单");
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * 内容指纹：把整期重算所依据的全部 eventId 排序后做确定性摘要。
+     * 同一批输入（两次结算之间该账期可见用量集合不变）指纹必然相同；
+     * 新到一批用量后集合变大，指纹随之变化，从而允许新补差逐笔累加。
+     */
+    private static String contentFingerprint(List<String> basisEventIds) {
+        List<String> sorted = basisEventIds.stream().sorted().toList();
+        try {
+            var md = java.security.MessageDigest.getInstance("SHA-256");
+            for (String eventId : sorted) {
+                md.update((eventId + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+            byte[] digest = md.digest();
+            StringBuilder sb = new StringBuilder(digest.length * 2);
+            for (byte b : digest) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 不可用", e);
         }
     }
 
