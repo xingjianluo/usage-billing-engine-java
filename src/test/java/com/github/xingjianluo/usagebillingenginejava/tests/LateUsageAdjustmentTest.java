@@ -261,8 +261,15 @@ class LateUsageAdjustmentTest {
         assertEquals(Money.of("190.00"), a2.previouslyBilled());
         assertTrue(adjustmentService.pay(a2.adjustmentId()).success());
 
+        // 同输入重放（即便上一笔已收款）：回读同一笔、金额/单号一致，不再落第二笔、不重复收款。
         AdjustmentResult a3 = adjustmentService.settle(subId, period, "mb-3");
-        assertEquals(Money.zero(), a3.delta());
+        assertFalse(a3.created());
+        assertEquals(a2.adjustmentId(), a3.adjustmentId(),
+                "同一批输入重放必须回读既有补差单，不能因已收款而返回空单号/0");
+        assertEquals(Money.of("10.00"), a3.delta(),
+                "同一批输入重放返回的补差金额必须与首次一致、可复现");
+        assertEquals(AdjustmentStatus.PAID,
+                adjustmentService.getAdjustment(a3.adjustmentId()).status());
 
         Money telescoped = originalNet.plus(a1.delta()).plus(a2.delta());
         log.info("[关键输入] 原 {} + 补差 {} + 补差 {} = {}，最终重算 {}",

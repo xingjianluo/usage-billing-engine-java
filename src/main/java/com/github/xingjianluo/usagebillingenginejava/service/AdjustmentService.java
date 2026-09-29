@@ -42,9 +42,14 @@ import org.springframework.stereotype.Service;
  *
  * 不改写原账单：补差是新单据，原发票编号/明细/金额永不变化。
  *
- * 幂等：批次键 (subscriptionId, period, batchId) 唯一 + 订阅级锁；
- *   - 同一批输入重放/并发：batchId 命中既有补差单，created=false 返回同一份，不重复入账；
- *   - 无新增用量或重算后总额无变化：delta=0，明确不产生补差单、不产生费用。
+ * 幂等（双重）：批次键 (subscriptionId, period, batchId) 唯一 + 订阅级锁，
+ * 另外对“当前可见输入指纹”（整期重算依据事件集合 basisEventIds + 重算应计总额）回读既有补差单：
+ *   - 同一批输入重放/并发/重试（无论是否带 batchId，包括客户端超时重试、同一批处理两遍）：
+ *     指纹命中既有补差单，created=false 返回同一份（金额、单号完全一致），不重复入账；
+ *   - 因此“没带 batchId 的重放”绝不会因为 previouslyBilled 已含首单而误判成 delta=0，
+ *     已产生但尚未收款的补差单不可能从返回结果里被藏掉；
+ *   - 只有不存在指纹匹配的既有补差单、且重算总额确实等于此前已计时，才是真正零净增：
+ *     delta=0，明确不产生补差单、不产生费用。
  *
  * 收款/退款口径与发票一致：补差单只在收款成功后登一笔 CHARGE；失败可区分原因并可重试，
  * 达到上限进入终态不静默丢单；PAID 补差可退款登 REFUND。
@@ -131,6 +136,22 @@ public class AdjustmentService {
                             + "重算应计总额={}, 此前已计={}, delta={}",
                     subscriptionId, period.start(), invoice.total(), prior.size(),
                     recalculatedTotal, previouslyBilled, delta);
+
+            // 输入指纹幂等（不依赖 batchId，batchId 可空）：同一批输入的重放/超时重试/
+            // 并发落败，必然重算出完全相同的依据事件集合与应计总额。命中既有补差单就回读
+            // 同一份（金额、单号一致），哪怕望远镜相减后 delta 已被该单摊成 0——
+            // 已产生但尚未收款的补差绝不能在此时被当成“零净增”藏掉。
+            Adjustment sameInput = findByInputFingerprint(prior, calc.basisEventIds(),
+                    recalculatedTotal);
+            if (sameInput != null) {
+                log.info("同一批输入已结算过（指纹回读，batchId={}），返回既有补差单: "
+                                + "adjustmentId={}, delta={}, status={}（不重复生成/入账）",
+                        batchId, sameInput.id(), sameInput.delta(), sameInput.status());
+                String why = batchId == null
+                        ? "同一批输入重放/重试（未提供批次标识），返回既有补差单"
+                        : "同一批输入重放/并发（指纹一致），返回既有补差单";
+                return toResult(sameInput, false, why);
+            }
 
             // 用量只增不减，迟到补报不应让整期应计下降；若出现（如套餐版本回填变更），
             // 属于另一类“补退”流程，显式报错而不是静默记错账。
@@ -307,9 +328,28 @@ public class AdjustmentService {
         return snapshot(adjustment, true, PaymentFailureReason.NONE);
     }
 
+    /**
+     * 在该账期既有补差单中查找与“当前可见输入”同指纹的一份。
+     *
+     * 指纹 = 整期重算依据的事件集合（{@code basisEventIds}，仓储按 occurredAt+eventId
+     * 确定排序，同一批输入必然逐位相同）+ 重算应计总额（区分账期内套餐版本回填导致的同事件、
+     * 不同价）。用量事件只增不删，事件集合只能随新批次扩大，因此“集合相等”当且仅当
+     * “同一批输入重放”，不会误吞后续新批次。命中多份（理论上不应发生）时取序号最大的一份。
+     */
+    private Adjustment findByInputFingerprint(List<Adjustment> prior, List<String> basisEventIds,
+                                              Money recalculatedTotal) {
+        Adjustment matched = null;
+        for (Adjustment a : prior) {
+            if (a.basisEventIds().equals(basisEventIds)
+                    && a.recalculatedTotal().equals(recalculatedTotal)) {
+                matched = a;
+            }
+        }
+        return matched;
+    }
+
     private String summarize(BillingCalculation calc, Invoice invoice, Money recalculated,
-                             Money previouslyBilled) {
-        return "整期重算应计=" + recalculated + "（原发票 " + invoice.id()
+                             Money previouslyBilled) {        return "整期重算应计=" + recalculated + "（原发票 " + invoice.id()
                 + " 净额=" + invoice.total() + " + 历史补差="
                 + previouslyBilled.minus(invoice.total()) + "），各套餐片累计="
                 + calc.meterTotalsBySegment() + "，依据事件=" + calc.basisEventIds();
